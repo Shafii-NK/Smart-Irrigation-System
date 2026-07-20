@@ -18,10 +18,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     body { font-family: 'Roboto', sans-serif; text-align: center; background-color: #121212; color: #e0e0e0; margin: 0; padding: 0; }
     h1 { color: #bb86fc; margin: 20px 0; font-weight: 500; }
     .widget { display: flex; justify-content: space-around; flex-wrap: wrap; padding: 20px; max-width: 900px; margin: auto; }
-    .sensor, .status { font-size: 1.2rem; margin: 20px; padding: 20px; background: #1e1e1e; border-radius: 10px; box-shadow: 0 0 15px rgba(0, 0, 0, 0.5); width: 200px; text-align: center; transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out; }
+    .sensor, .status { font-size: 1.2rem; margin: 20px; padding: 20px; background: #1e1e1e; border-radius: 10px; box-shadow: 0 0 15px rgba(0, 0, 0, 0.5); width: 200px; text-align: center; transition: all 0.3s ease; }
     .sensor:hover, .status:hover { transform: translateY(-10px); box-shadow: 0 0 25px rgba(0, 0, 0, 0.7); }
     .status { display: flex; justify-content: center; align-items: center; background-color: #00c853; color: #fff; }
-    .status.on { background-color: #b00020; }
+    .status.off { background-color: #b00020; }
     .centered { display: flex; justify-content: center; }
   </style>
 </head>
@@ -43,7 +43,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
   <div class="centered">
     <div class="status" id="pump-status">
-      Pump Status: ON
+      Pump Status: OFF
     </div>
   </div>
   <script>
@@ -54,11 +54,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById("humidity").innerHTML = data.humidity;
         const pumpStatus = document.getElementById("pump-status");
         if (data.pumpStatus) {
-          pumpStatus.classList.add('on');
-          pumpStatus.innerHTML = 'Pump Status: OFF';
-        } else {
-          pumpStatus.classList.remove('on');
+          pumpStatus.classList.remove('off');
           pumpStatus.innerHTML = 'Pump Status: ON';
+        } else {
+          pumpStatus.classList.add('off');
+          pumpStatus.innerHTML = 'Pump Status: OFF';
         }
       });
     }, 2000);
@@ -84,20 +84,26 @@ const int fanPin2 = 4;
 const int fanEN = 5;
 
 //Heater Pin
-
 const int heater = 18;
+
+// ============================================================
+// SECURITY: Configure WiFi and ThingSpeak credentials below
+// ============================================================
 // Wi-Fi credentials
-char ssid[] = "ANI";
-char pass[] = "Anirsharma";
+char ssid[] = "YOUR_SSID_HERE";           // CHANGE THIS
+char pass[] = "YOUR_PASSWORD_HERE";       // CHANGE THIS
 
 // ThingSpeak credentials
-unsigned long myChannelNumber = 2751970;
-const char * myWriteAPIKey = "4MQL8MY8XM9X6009";
+unsigned long myChannelNumber = 0;         // CHANGE THIS
+const char * myWriteAPIKey = "YOUR_API_KEY_HERE"; // CHANGE THIS
+// ============================================================
 
 // Adjusted threshold for inverse mapping
 const int moistureThreshold = 40; // Moisture percentage threshold for inverse mapping
 const float tempHighThreshold = 30.0; // High temperature in Celsius
 const float humidityLowThreshold = 40.0; // Low humidity percentage
+const float tempCoolingThreshold = 26.0; // Fan cooling temperature
+const float tempHeatingThreshold = 24.0; // Heater activation temperature
 
 WiFiClient client;
 AsyncWebServer server(80);
@@ -156,7 +162,7 @@ void setup() {
     json += "\"temperature\":" + String(temperature) + ",";
     json += "\"humidity\":" + String(humidity) + ",";
     json += "\"moisture\":" + String(moisturePercent) + ",";
-    json += "\"pumpStatus\":" + String(digitalRead(relayPin) == HIGH ? "true" : "false");
+    json += "\"pumpStatus\":" + String(pumpStatus ? "true" : "false");
     json += "}";
     request->send(200, "application/json", json);
   });
@@ -188,21 +194,23 @@ void loop() {
     pumpStatus = false;
   }
 
-  if (temperature > 26)
-  {
+  // Temperature control - improved logic
+  if (temperature > tempCoolingThreshold) {
+    // Cooling mode: turn on fan
     digitalWrite(fanPin1, HIGH);
     digitalWrite(fanPin2, LOW);
+    digitalWrite(heater, LOW);
   }
-  else if (temperature < 24)
-  {
-    digitalWrite(fanPin1, HIGH);
-    digitalWrite(fanPin1, HIGH);
+  else if (temperature < tempHeatingThreshold) {
+    // Heating mode: turn on heater and stop fan
+    digitalWrite(fanPin1, LOW);
+    digitalWrite(fanPin2, LOW);
     digitalWrite(heater, HIGH);
   }
-  else
-  {
-    digitalWrite(fanPin1, HIGH);
-    digitalWrite(fanPin1, HIGH);
+  else {
+    // Neutral zone: turn off all systems
+    digitalWrite(fanPin1, LOW);
+    digitalWrite(fanPin2, LOW);
     digitalWrite(heater, LOW);
   }
 
