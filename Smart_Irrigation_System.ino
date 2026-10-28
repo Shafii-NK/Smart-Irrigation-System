@@ -387,7 +387,6 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
 
   <script>
-    let updateCount = 0;
     const refreshInterval = 2000; // 2 seconds
 
     // Update time display
@@ -468,13 +467,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     fetchData();
     setInterval(fetchData, refreshInterval);
 
-    // Update refresh indicator
-    setInterval(() => {
-      updateCount++;
-      if (updateCount % 30 === 0) {
-        updateCount = 0;
-      }
-    }, 100);
   </script>
 </body>
 </html>
@@ -513,10 +505,15 @@ const char * myWriteAPIKey = "YOUR_API_KEY_HERE"; // CHANGE THIS
 
 // Adjusted threshold for inverse mapping
 const int moistureThreshold = 40; // Moisture percentage threshold for inverse mapping
+// Hysteresis around 40% avoids pump chatter near the cutoff (+/- 5% band).
+const int moisturePumpOnThreshold = moistureThreshold + 5;
+const int moisturePumpOffThreshold = moistureThreshold - 5;
 const float tempHighThreshold = 30.0; // High temperature in Celsius
 const float humidityLowThreshold = 40.0; // Low humidity percentage
 const float tempCoolingThreshold = 26.0; // Fan cooling temperature
 const float tempHeatingThreshold = 24.0; // Heater activation temperature
+const unsigned long sensorControlIntervalMs = 2000;
+const unsigned long thingSpeakIntervalMs = 15000;
 
 WiFiClient client;
 AsyncWebServer server(80);
@@ -528,7 +525,53 @@ int moisturePercent = 0;
 bool pumpStatus = false; // Track the status of the pump
 bool fanStatus = false; // Track the status of the fan
 bool heaterStatus = false; // Track the status of the heater
+bool hasValidDhtReading = false;
+unsigned long lastSensorControlUpdate = 0;
 unsigned long lastThingSpeakUpdate = 0; // Track the last ThingSpeak update time
+
+enum ClimateMode {
+  CLIMATE_UNKNOWN,
+  CLIMATE_NEUTRAL,
+  CLIMATE_COOLING,
+  CLIMATE_HEATING
+};
+
+ClimateMode climateMode = CLIMATE_UNKNOWN;
+
+void applyPumpState(bool desiredState) {
+  if (pumpStatus != desiredState) {
+    digitalWrite(relayPin, desiredState ? HIGH : LOW);
+    pumpStatus = desiredState;
+  }
+}
+
+void applyClimateMode(ClimateMode desiredMode) {
+  if (climateMode == desiredMode) {
+    return;
+  }
+
+  if (desiredMode == CLIMATE_COOLING) {
+    digitalWrite(fanPin1, HIGH);
+    digitalWrite(fanPin2, LOW);
+    digitalWrite(heater, LOW);
+    fanStatus = true;
+    heaterStatus = false;
+  } else if (desiredMode == CLIMATE_HEATING) {
+    digitalWrite(fanPin1, LOW);
+    digitalWrite(fanPin2, LOW);
+    digitalWrite(heater, HIGH);
+    fanStatus = false;
+    heaterStatus = true;
+  } else {
+    digitalWrite(fanPin1, LOW);
+    digitalWrite(fanPin2, LOW);
+    digitalWrite(heater, LOW);
+    fanStatus = false;
+    heaterStatus = false;
+  }
+
+  climateMode = desiredMode;
+}
 
 void setup() {
   // Initialize serial communication
@@ -573,18 +616,29 @@ void setup() {
 
   // Route to get sensor data
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
-    String json = "{";
-    json += "\"temperature\":" + String(temperature) + ",";
-    json += "\"humidity\":" + String(humidity) + ",";
-    json += "\"moisture\":" + String(moisturePercent) + ",";
-    json += "\"pumpStatus\":" + String(pumpStatus ? "true" : "false") + ",";
-    json += "\"fanStatus\":" + String(fanStatus ? "true" : "false") + ",";
-    json += "\"heaterStatus\":" + String(heaterStatus ? "true" : "false") + ",";
-    json += "\"moistureThreshold\":" + String(moistureThreshold) + ",";
-    json += "\"tempCooling\":" + String(tempCoolingThreshold) + ",";
-    json += "\"tempHeating\":" + String(tempHeatingThreshold) + ",";
-    json += "\"tempHigh\":" + String(tempHighThreshold);
-    json += "}";
+    // Fixed-size JSON buffer avoids heap fragmentation from repeated String concatenation.
+    char json[256];
+    int written = snprintf(
+      json,
+      sizeof(json),
+      "{\"temperature\":%.2f,\"humidity\":%.2f,\"moisture\":%d,\"pumpStatus\":%s,\"fanStatus\":%s,\"heaterStatus\":%s,\"moistureThreshold\":%d,\"tempCooling\":%.2f,\"tempHeating\":%.2f,\"tempHigh\":%.2f}",
+      temperature,
+      humidity,
+      moisturePercent,
+      pumpStatus ? "true" : "false",
+      fanStatus ? "true" : "false",
+      heaterStatus ? "true" : "false",
+      moistureThreshold,
+      tempCoolingThreshold,
+      tempHeatingThreshold,
+      tempHighThreshold
+    );
+
+    if (written < 0 || written >= (int)sizeof(json)) {
+      request->send(500, "text/plain", "Failed to build JSON response");
+      return;
+    }
+
     request->send(200, "application/json", json);
   });
 
@@ -593,69 +647,65 @@ void setup() {
 }
 
 void loop() {
-  // Read the analog value from the soil moisture sensor
-  int sensorValue = analogRead(soilMoisturePin);
+  unsigned long now = millis();
 
-  // Convert the analog value to an inverse percentage
-  moisturePercent = map(sensorValue, 4095, 0, 0, 100);
+  // Non-blocking scheduler keeps loop responsive while running control logic ~every 2 seconds.
+  if (now - lastSensorControlUpdate >= sensorControlIntervalMs) {
+    lastSensorControlUpdate = now;
 
-  // Read humidity and temperature values from DHT11
-  humidity = dht.readHumidity();
-  temperature = dht.readTemperature();
+    // Read the analog value from the soil moisture sensor
+    int sensorValue = analogRead(soilMoisturePin);
 
-  // Control the water pump based on thresholds
-  if (moisturePercent > moistureThreshold) {
-    digitalWrite(relayPin, HIGH); // Turn on the water pump
-    pumpStatus = true;
-  } else if (temperature > tempHighThreshold && humidity < humidityLowThreshold) {
-    digitalWrite(relayPin, HIGH); // Turn on the water pump
-    pumpStatus = true;
-  } else {
-    digitalWrite(relayPin, LOW); // Turn off the water pump
-    pumpStatus = false;
+    // Convert the analog value to an inverse percentage
+    moisturePercent = map(sensorValue, 4095, 0, 0, 100);
+
+    // Validate DHT reads; retain and reuse the last valid readings when a read fails.
+    float newHumidity = dht.readHumidity();
+    float newTemperature = dht.readTemperature();
+    if (!isnan(newHumidity) && !isnan(newTemperature)) {
+      humidity = newHumidity;
+      temperature = newTemperature;
+      hasValidDhtReading = true;
+    } else {
+      Serial.println("DHT11 read failed; keeping previous valid readings.");
+    }
+
+    bool moistureDemand = pumpStatus ? (moisturePercent > moisturePumpOffThreshold) : (moisturePercent > moisturePumpOnThreshold);
+    bool hotDryDemand = hasValidDhtReading && temperature > tempHighThreshold && humidity < humidityLowThreshold;
+    applyPumpState(moistureDemand || hotDryDemand);
+
+    if (hasValidDhtReading) {
+      ClimateMode desiredMode = CLIMATE_NEUTRAL;
+      if (temperature > tempCoolingThreshold) {
+        desiredMode = CLIMATE_COOLING;
+      } else if (temperature < tempHeatingThreshold) {
+        desiredMode = CLIMATE_HEATING;
+      }
+      applyClimateMode(desiredMode);
+    }
+
+    // Print values to the Serial Monitor
+    Serial.print("Soil Moisture (Inverted): ");
+    Serial.print(moisturePercent);
+    Serial.println("%");
+
+    Serial.print("Humidity: ");
+    Serial.print(humidity);
+    Serial.println("%");
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println("C");
   }
 
-  // Temperature control - improved logic
-  if (temperature > tempCoolingThreshold) {
-    // Cooling mode: turn on fan
-    digitalWrite(fanPin1, HIGH);
-    digitalWrite(fanPin2, LOW);
-    digitalWrite(heater, LOW);
-    fanStatus = true;
-    heaterStatus = false;
-  }
-  else if (temperature < tempHeatingThreshold) {
-    // Heating mode: turn on heater and stop fan
-    digitalWrite(fanPin1, LOW);
-    digitalWrite(fanPin2, LOW);
-    digitalWrite(heater, HIGH);
-    fanStatus = false;
-    heaterStatus = true;
-  }
-  else {
-    // Neutral zone: turn off all systems
-    digitalWrite(fanPin1, LOW);
-    digitalWrite(fanPin2, LOW);
-    digitalWrite(heater, LOW);
-    fanStatus = false;
-    heaterStatus = false;
-  }
+  if (now - lastThingSpeakUpdate >= thingSpeakIntervalMs) {
+    lastThingSpeakUpdate = now;
 
-  // Print values to the Serial Monitor
-  Serial.print("Soil Moisture (Inverted): ");
-  Serial.print(moisturePercent);
-  Serial.println("%");
+    if (!hasValidDhtReading) {
+      Serial.println("Skipping ThingSpeak update: no valid DHT11 reading yet.");
+      return;
+    }
 
-  Serial.print("Humidity: ");
-  Serial.print(humidity);
-  Serial.println("%");
-
-  Serial.print("Temperature: ");
-  Serial.print(temperature);
-  Serial.println("C");
-
-  // Upload data to ThingSpeak every 15 seconds
-  if (millis() - lastThingSpeakUpdate >= 15000) {
     ThingSpeak.setField(1, moisturePercent);
     ThingSpeak.setField(2, temperature);
     ThingSpeak.setField(3, humidity);
@@ -666,9 +716,5 @@ void loop() {
     } else {
       Serial.println("Problem updating channel. HTTP error code: " + String(x));
     }
-
-    lastThingSpeakUpdate = millis();
   }
-
-  delay(2000); // Delay before the next loop iteration
 }
